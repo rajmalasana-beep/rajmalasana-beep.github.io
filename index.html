@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Atlanta Overseas | Employee Portal</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
+    <style>
+        @media print { body * { visibility: hidden; } #ghost, #ghost * { visibility: visible; } #ghost { position: absolute; left: 0; top: 0; width: 100%; } }
+        input[type="date"]::-webkit-calendar-picker-indicator { position: absolute; top:0; left:0; right:0; bottom:0; width:auto; height:auto; color:transparent; background:transparent; }
+    </style>
+</head>
+<body class="bg-slate-100 text-slate-800 font-sans selection:bg-blue-100 overflow-hidden fixed inset-0">
+    <div id="root" class="h-full flex flex-col"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useMemo } = React;
+        // ==========================================
+        // FIREBASE CLOUD LAYER (multi-phone real-time sync)
+        // Users  -> Firebase Auth (<id>@atlanta-portal.app) + Firestore users/{uid}
+        // Ledger -> Firestore entries/{id}, live via onSnapshot
+        // Admin  -> Firestore meta/setup {adminUid} (created once, on first run)
+        // ==========================================
+        const firebaseConfig = {
+            apiKey: "AIzaSyCihVxj5ZTUE78tilzbDGI0dKN5kWCY6r8",
+            authDomain: "atlanta-portal.firebaseapp.com",
+            projectId: "atlanta-portal",
+            storageBucket: "atlanta-portal.firebasestorage.app",
+            messagingSenderId: "17763895642",
+            appId: "1:17763895642:web:de492fd81e1174a5f88b63"
+        };
+        firebase.initializeApp(firebaseConfig);
+        const auth = firebase.auth();
+        const db = firebase.firestore();
+        const FV = firebase.firestore.FieldValue;
+        const TS = firebase.firestore.Timestamp;
+        auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(() => {});
+
+        const EMAIL_DOMAIN = 'atlanta-portal.app';
+        const ADMIN_ID = 'Admin';
+        const RETENTION_DAYS = 3;
+        const SESSION_HOURS = 12;
+        const MIN_PASS = 6; // Firebase Auth minimum password length
+        const LOGIN_AT_KEY = 'ao_login_at';
+        const ID_RE = /^[A-Za-z0-9._-]{1,30}$/;
+        const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+        const idToEmail = (id) => `${String(id).trim().toLowerCase()}@${EMAIL_DOMAIN}`;
+        const dateStr = (d) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+        // Keep entries with date >= today - 3 days (same rule as before)
+        const cutoffDate = () => { const c = new Date(); c.setDate(c.getDate() - RETENTION_DAYS); return dateStr(c); };
+        // Moment an entry for `date` falls out of the retention window (local midnight of date + 4 days)
+        const expireAtFor = (date) => { const [y, m, d] = String(date).split('-').map(Number); return TS.fromDate(new Date(y, m - 1, d + RETENTION_DAYS + 1)); };
+        const sessionExpired = () => (Date.now() - (Number(localStorage.getItem(LOGIN_AT_KEY)) || 0)) > SESSION_HOURS * 3600 * 1000;
+
+        const errMsg = (e) => {
+            const c = (e && e.code) || '';
+            if(['auth/invalid-credential','auth/wrong-password','auth/user-not-found','auth/invalid-email','auth/invalid-login-credentials'].includes(c)) return "Invalid Employee ID or Access Key.";
+            if(c === 'auth/too-many-requests') return "Too many failed attempts. Try again later.";
+            if(c === 'auth/network-request-failed' || c === 'unavailable') return "Network error. Check your internet connection.";
+            if(c === 'auth/email-already-in-use') return "Employee ID already exists!";
+            if(c === 'auth/weak-password') return `Access Key must be at least ${MIN_PASS} characters.`;
+            if(c === 'permission-denied') return "ACCESS DENIED.";
+            return (e && e.message) ? e.message : String(e);
+        };
+
+        // Secondary Firebase app: lets the Admin create employees (or confirm the Master Key)
+        // without signing the Admin out of the main session.
+        const getSecondary = async () => {
+            const app = firebase.apps.find(a => a.name === 'secondary') || firebase.initializeApp(firebaseConfig, 'secondary');
+            const a = app.auth();
+            await a.setPersistence(firebase.auth.Auth.Persistence.NONE).catch(() => {});
+            return { auth: a, db: app.firestore() };
+        };
+
+        // Run batched writes in chunks (Firestore batch limit is 500 ops)
+        const commitInChunks = async (ops, database = db) => {
+            for(let i = 0; i < ops.length; i += 400) {
+                const b = database.batch();
+                ops.slice(i, i + 400).forEach(fn => fn(b));
+                await b.commit();
+            }
+        };
+
+        const setupExists = async () => (await db.doc('meta/setup').get()).exists;
+
+        // Returns {uid, name, role} for an active user, or null if revoked / unknown.
+        // Self-repair: the Admin (uid in meta/setup) always gets a valid, active admin profile.
+        const loadProfileOnce = async (uid) => {
+            const [meta, prof] = await Promise.all([db.doc('meta/setup').get({ source: 'server' }), db.doc(`users/${uid}`).get({ source: 'server' })]);
+            const isAdmin = meta.exists && meta.data().adminUid === uid;
+            if(isAdmin) {
+                const d = prof.exists ? prof.data() : null;
+                if(!d || d.role !== 'admin' || d.active !== true || d.id !== ADMIN_ID || d.name !== ADMIN_ID) {
+                    await db.doc(`users/${uid}`).set({ id: ADMIN_ID, name: ADMIN_ID, role: 'admin', active: true, createdAt: FV.serverTimestamp() });
+                }
+                return { uid, name: ADMIN_ID, role: 'admin' };
+            }
+            if(!prof.exists || prof.data().active !== true) return null;
+            return { uid, name: prof.data().id, role: 'user' };
+        };
+        // Retries short network glitches (slow mobile data) instead of wrongly showing "not active"
+        const loadProfile = async (uid) => {
+            let lastErr;
+            for(let i = 0; i < 4; i++) {
+                try { return await loadProfileOnce(uid); }
+                catch(e) {
+                    lastErr = e;
+                    if(e && e.code === 'permission-denied') throw e;
+                    await new Promise(r => setTimeout(r, 1500 * (i + 1)));
+                }
+            }
+            throw lastErr;
+        };
+
+        // One-time first-run setup: create the Admin account with a user-chosen password
+        const createInitialAdmin = async (password) => {
+            if(await setupExists()) throw new Error("Admin already exists.");
+            let cred;
+            try { cred = await auth.createUserWithEmailAndPassword(idToEmail(ADMIN_ID), password); }
+            catch(e) {
+                if(e.code !== 'auth/email-already-in-use') throw e;
+                cred = await auth.signInWithEmailAndPassword(idToEmail(ADMIN_ID), password); // resume an interrupted setup
+            }
+            const uid = cred.user.uid;
+            await db.doc('meta/setup').set({ adminUid: uid, createdAt: FV.serverTimestamp() });
+            await db.doc(`users/${uid}`).set({ id: ADMIN_ID, name: ADMIN_ID, role: 'admin', active: true, createdAt: FV.serverTimestamp() });
+        };
+
+        // 3-day auto cleanup: Admin removes everything older; employees remove their own / expired ones
+        const runAutoCleanup = async (user) => {
+            if(!user) return;
+            try {
+                const snap = await db.collection('entries').where('date', '<', cutoffDate()).get();
+                const now = Date.now();
+                const docs = snap.docs.filter(d => {
+                    const x = d.data();
+                    return user.role === 'admin' || x.createdByUid === user.uid || (x.expireAt && x.expireAt.toMillis() <= now);
+                });
+                await commitInChunks(docs.map(d => b => b.delete(d.ref)));
+            } catch(e) {}
+        };
+
+        const cleanEntry = (e, nameToUid) => {
+            if(!e || typeof e !== 'object' || !e.id || !DATE_RE.test(String(e.date || ''))) return null;
+            const amount = parseInt(String(e.amount).replace(/,/g, ''), 10);
+            if(!Number.isSafeInteger(amount)) return null;
+            const id = String(e.id).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 100);
+            if(!id) return null;
+            const createdBy = typeof e.createdBy === 'string' ? e.createdBy.slice(0, 40) : '';
+            return {
+                id, amount, date: e.date,
+                time: typeof e.time === 'string' ? e.time.slice(0, 20) : '',
+                status: e.status === 'pending' ? 'pending' : 'ok',
+                createdBy,
+                createdByUid: (typeof e.createdByUid === 'string' && e.createdByUid) ? e.createdByUid : (nameToUid[createdBy.toLowerCase()] || null),
+                ts: Number.isSafeInteger(e.ts) ? e.ts : (Number.isSafeInteger(Number(e.id)) ? Number(e.id) : 0),
+                expireAt: expireAtFor(e.date)
+            };
+        };
+
+        const Icon = ({ p, size=20, c="", onClick }) => <svg onClick={onClick} xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={c} style={{cursor:onClick?'pointer':'default'}}>{p}</svg>;
+        const Refresh = (p) => <Icon {...p} p={<><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></>} />;
+        const Calendar = (p) => <Icon {...p} p={<><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></>} />;
+        const Share = (p) => <Icon {...p} p={<><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/></>} />;
+        const Check = (p) => <Icon {...p} p={<><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></>} />;
+        const Circle = (p) => <Icon {...p} p={<><circle cx="12" cy="12" r="10"/></>} />;
+        const Trash = (p) => <Icon {...p} p={<><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></>} />;
+        const Edit = (p) => <Icon {...p} p={<><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></>} />;
+        const Arrow = (p) => <Icon {...p} p={<><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></>} />;
+        const ClearAll = (p) => <Icon {...p} p={<><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></>} />;
+        const Lock = (p) => <Icon {...p} p={<><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></>} />;
+        const LogOut = (p) => <Icon {...p} p={<><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></>} />;
+        const UserIcon = (p) => <Icon {...p} p={<><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></>} />;
+        const Settings = (p) => <Icon {...p} p={<><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></>} />;
+        const Shield = (p) => <Icon {...p} p={<><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></>} />;
+
+        const formatCurrency = (n) => {
+            const isNegative = n < 0;
+            const absVal = Math.abs(n);
+            const formatted = new Intl.NumberFormat('en-IN',{maximumFractionDigits:0,style:'currency',currency:'INR'}).format(absVal).replace('₹','₹ ').trim();
+            return isNegative ? `-${formatted}` : formatted;
+        };
+        const getToday = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; };
+
+        function App() {
+            const [view, setView] = useState('boot'); 
+            const [entries, setEntries] = useState([]);
+            const [users, setUsers] = useState([]);
+            
+            const [loginUser, setLoginUser] = useState('');
+            const [loginPass, setLoginPass] = useState('');
+            const [showPass, setShowPass] = useState(false);
+            const [currentUser, setCurrentUser] = useState(null); 
+
+            const [selectedDate, setSelectedDate] = useState(getToday());
+            const [val, setVal] = useState('');
+            const [loading, setLoading] = useState(false);
+            const [syncing, setSyncing] = useState(false);
+            const [editModal, setEditModal] = useState({ open: false, id: null, amount: '' });
+            
+            const [newUser, setNewUser] = useState('');
+            const [newPass, setNewPass] = useState('');
+            const [busy, setBusy] = useState(false);
+            const [setupPass, setSetupPass] = useState('');
+            const [setupPass2, setSetupPass2] = useState('');
+            const restoreRef = useRef(null);
+            const suspendAuthRef = useRef(false); // ignore auth events during first-run setup
+            const activeUidRef = useRef(null);
+
+            const inputRef = useRef(null);
+
+            const enter = (prof) => {
+                activeUidRef.current = prof.uid;
+                setCurrentUser(prof);
+                setView(prof.role === 'admin' ? 'admin' : 'ledger');
+            };
+
+            const handleLogout = (msg = null) => {
+                const wasActive = activeUidRef.current !== null;
+                activeUidRef.current = null;
+                localStorage.removeItem(LOGIN_AT_KEY);
+                setCurrentUser(null);
+                setEntries([]);
+                setUsers([]);
+                setView('login');
+                auth.signOut().catch(() => {});
+                if(msg && wasActive) alert(msg);
+            };
+
+            // Restore an existing session (Firebase keeps it), max 12h
+            useEffect(() => {
+                const unsub = auth.onAuthStateChanged(async (u) => {
+                    if(suspendAuthRef.current) return;
+                    if(u) {
+                        if(sessionExpired()) { await auth.signOut().catch(() => {}); return; }
+                        if(activeUidRef.current === u.uid) return;
+                        let prof = null;
+                        try { prof = await loadProfile(u.uid); }
+                        catch(e) {
+                            await auth.signOut().catch(() => {});
+                            localStorage.removeItem(LOGIN_AT_KEY);
+                            setView('login');
+                            alert(e && e.code === 'permission-denied'
+                                ? "Login blocked by server rules (permission-denied). Please contact IT."
+                                : "Could not reach the server. Check your internet and try again. (" + ((e && (e.code || e.message)) || 'error') + ")");
+                            return;
+                        }
+                        if(!prof) {
+                            await auth.signOut().catch(() => {});
+                            alert("ACCESS DENIED: This Employee ID is not active.");
+                            return;
+                        }
+                        enter(prof);
+                    } else {
+                        if(activeUidRef.current) return;
+                        let exists = true;
+                        try { exists = await setupExists(); } catch(e) {}
+                        setView(exists ? 'login' : 'setup');
+                    }
+                });
+                return unsub;
+            }, []);
+
+            // Live data: entries (all phones), own profile (revocation), user directory (admin)
+            useEffect(() => {
+                if(!currentUser) return;
+                const uid = currentUser.uid;
+                const mine = () => activeUidRef.current === uid;
+                const unsubs = [];
+                unsubs.push(db.collection('entries').where('date', '>=', cutoffDate()).onSnapshot({ includeMetadataChanges: true }, snap => {
+                    if(!mine()) return;
+                    const list = snap.docs.map(d => ({ ...d.data(), id: d.id }));
+                    list.sort((a, b) => ((a.ts || 0) - (b.ts || 0)) || String(a.id).localeCompare(String(b.id)));
+                    setEntries(list);
+                    setSyncing(snap.metadata.hasPendingWrites);
+                }, err => { if(mine() && err.code === 'permission-denied') handleLogout("Session Expired. Please authenticate again."); }));
+                unsubs.push(db.doc(`users/${uid}`).onSnapshot(d => {
+                    if(mine() && (!d.exists || d.data().active !== true)) handleLogout("ACCESS DENIED: Your access has been revoked.");
+                }, () => {}));
+                if(currentUser.role === 'admin') {
+                    unsubs.push(db.collection('users').onSnapshot(snap => {
+                        if(!mine()) return;
+                        const list = snap.docs.map(d => ({ uid: d.id, name: d.data().id, role: d.id === uid ? 'admin' : 'user', active: d.data().active === true }));
+                        list.sort((a, b) => (a.role === 'admin' ? -1 : b.role === 'admin' ? 1 : (b.active - a.active) || a.name.localeCompare(b.name)));
+                        setUsers(list);
+                    }, () => {}));
+                }
+                runAutoCleanup(currentUser);
+                const iv = setInterval(() => {
+                    if(sessionExpired()) { handleLogout("Session Expired. Please authenticate again."); return; }
+                    runAutoCleanup(currentUser);
+                }, 60 * 1000);
+                return () => { unsubs.forEach(f => f()); clearInterval(iv); };
+            }, [currentUser?.uid]);
+
+            // Manual refresh (live sync already runs in the background)
+            const fetchData = async () => {
+                setSyncing(true);
+                try {
+                    const snap = await db.collection('entries').where('date', '>=', cutoffDate()).get({ source: 'server' });
+                    const list = snap.docs.map(d => ({ ...d.data(), id: d.id }));
+                    list.sort((a, b) => ((a.ts || 0) - (b.ts || 0)) || String(a.id).localeCompare(String(b.id)));
+                    setEntries(list);
+                } catch(e) { if(e.code === 'permission-denied') handleLogout("Session Expired. Please authenticate again."); }
+                setSyncing(false);
+            };
+
+            const writeOp = (p) => { setSyncing(true); return p.catch(e => alert("Data sync failed! " + errMsg(e))).finally(() => setSyncing(false)); };
+
+            const handleLogin = async (e) => {
+                e.preventDefault();
+                const id = loginUser.trim();
+                if(!ID_RE.test(id) || !loginPass) { alert("Authentication Failed. Invalid Employee ID or Access Key."); return; }
+                try {
+                    localStorage.setItem(LOGIN_AT_KEY, String(Date.now()));
+                    await auth.signInWithEmailAndPassword(idToEmail(id), loginPass);
+                    setLoginUser('');
+                    setLoginPass('');
+                } catch(err) {
+                    const c = err && err.code;
+                    if(c === 'auth/too-many-requests') alert("Too many failed attempts. Access temporarily locked. Try again later.");
+                    else if(c === 'auth/network-request-failed') alert("Login error: " + errMsg(err));
+                    else if(['auth/invalid-credential','auth/wrong-password','auth/user-not-found','auth/invalid-email','auth/invalid-login-credentials'].includes(c)) alert("Authentication Failed. Invalid Employee ID or Access Key.");
+                    else alert("Login error: " + errMsg(err) + (c ? " (" + c + ")" : ""));
+                }
+            };
+
+            const handleSetup = async (e) => {
+                e.preventDefault();
+                if(setupPass.length < MIN_PASS) { alert(`Access Key must be at least ${MIN_PASS} characters.`); return; }
+                if(setupPass !== setupPass2) { alert("Access Keys do not match."); return; }
+                suspendAuthRef.current = true;
+                try {
+                    await createInitialAdmin(setupPass);
+                    setSetupPass(''); setSetupPass2('');
+                    setLoginUser('Admin');
+                    alert("Admin account created. Please login with Employee ID 'Admin'.");
+                } catch(err) { alert("Setup failed: " + errMsg(err)); }
+                await auth.signOut().catch(() => {});
+                suspendAuthRef.current = false;
+                let exists = true;
+                try { exists = await setupExists(); } catch(e) {}
+                setView(exists ? 'login' : 'setup');
+            };
+
+            const handleBackup = async () => {
+                try {
+                    const [us, es] = await Promise.all([db.collection('users').get(), db.collection('entries').get()]);
+                    const backup = {
+                        app: 'atlanta-overseas-ledger', version: 2, backend: 'firebase', exportedAt: new Date().toISOString(),
+                        users: us.docs.map(d => ({ uid: d.id, name: d.data().id, role: d.data().role, active: d.data().active === true })),
+                        entries: es.docs.map(d => { const x = d.data(); return { id: d.id, amount: x.amount, date: x.date, time: x.time, status: x.status, createdBy: x.createdBy, createdByUid: x.createdByUid || null, ts: x.ts || 0 }; })
+                    };
+                    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = `ledger-backup-${getToday()}.json`;
+                    document.body.appendChild(a); a.click(); a.remove();
+                    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+                } catch(err) { alert("Backup failed: " + errMsg(err)); }
+            };
+
+            // Restore: replaces ALL cloud ledger entries; re-applies access flags for employees that still exist.
+            // Passwords are never in backups, so employees missing here must be re-created by the Admin.
+            const handleRestore = (e) => {
+                const file = e.target.files && e.target.files[0];
+                e.target.value = '';
+                if(!file) return;
+                const reader = new FileReader();
+                reader.onload = async () => {
+                    try {
+                        const obj = JSON.parse(reader.result);
+                        if(!obj || !Array.isArray(obj.entries) || (obj.users !== undefined && !Array.isArray(obj.users))) throw new Error("Invalid backup file.");
+                        if(!confirm("Restore will REPLACE all ledger entries on ALL devices. Proceed?")) return;
+                        setSyncing(true);
+                        const nameToUid = {};
+                        users.forEach(u => { nameToUid[String(u.name).toLowerCase()] = u.uid; });
+                        const cutoff = cutoffDate();
+                        const restored = obj.entries.map(x => cleanEntry(x, nameToUid)).filter(x => x && x.date >= cutoff);
+                        const existing = await db.collection('entries').get();
+                        const keep = new Set(restored.map(x => x.id));
+                        const ops = existing.docs.filter(d => !keep.has(d.id)).map(d => b => b.delete(d.ref));
+                        restored.forEach(x => ops.push(b => b.set(db.doc(`entries/${x.id}`), { ...x, createdAt: FV.serverTimestamp() })));
+                        const byUid = {}; users.forEach(u => { byUid[u.uid] = u; });
+                        const missing = [];
+                        (obj.users || []).forEach(u => {
+                            if(!u || typeof u.name !== 'string' || u.role === 'admin' || String(u.name).toLowerCase() === 'admin') return;
+                            const cur = (u.uid && byUid[u.uid]) || users.find(x => x.name.toLowerCase() === u.name.toLowerCase());
+                            if(!cur) { missing.push(u.name); return; }
+                            if(cur.role !== 'admin' && typeof u.active === 'boolean') ops.push(b => b.update(db.doc(`users/${cur.uid}`), { active: u.active, updatedAt: FV.serverTimestamp() }));
+                        });
+                        await commitInChunks(ops);
+                        setSyncing(false);
+                        alert(`Restore complete: ${restored.length} entries.` + (missing.length ? `\n\nThese Employee IDs are not in the directory and must be re-created with a new Access Key: ${missing.join(', ')}` : ''));
+                    } catch(err) { setSyncing(false); alert("Restore failed: " + errMsg(err)); }
+                };
+                reader.readAsText(file);
+            };
+
+            const handleCreateUser = async (e) => {
+                e.preventDefault();
+                const id = newUser.trim();
+                if(!id || !newPass || busy) return;
+                if(!ID_RE.test(id)) { alert("Employee ID may only use letters, numbers, '.', '-' or '_' (max 30)."); return; }
+                if(newPass.length < MIN_PASS) { alert(`Access Key must be at least ${MIN_PASS} characters.`); return; }
+                const dup = users.find(u => u.name.toLowerCase() === id.toLowerCase());
+                if(dup || id.toLowerCase() === ADMIN_ID.toLowerCase()) { alert(dup && !dup.active ? "Employee ID already exists (revoked). Use Restore Access on it." : "Employee ID already exists!"); return; }
+                setBusy(true);
+                const sec = await getSecondary();
+                try {
+                    let cred;
+                    try { cred = await sec.auth.createUserWithEmailAndPassword(idToEmail(id), newPass); }
+                    catch(err) {
+                        if(err.code !== 'auth/email-already-in-use') throw err;
+                        // Login exists without a profile (e.g. an interrupted earlier attempt): adopt it if the key matches
+                        try { cred = await sec.auth.signInWithEmailAndPassword(idToEmail(id), newPass); } catch(e2) { throw err; }
+                    }
+                    await db.doc(`users/${cred.user.uid}`).set({ id, name: id, role: 'user', active: true, createdAt: FV.serverTimestamp() });
+                    setNewUser('');
+                    setNewPass('');
+                    alert("Employee directory updated!");
+                } catch(err) { alert("Update failed: " + errMsg(err)); }
+                await sec.auth.signOut().catch(() => {});
+                setBusy(false);
+            };
+
+            const deleteUser = (u) => {
+                if(u.role === 'admin') { alert("Cannot revoke Master Admin"); return; }
+                if(confirm(`Revoke access for Employee: ${u.name}?`)) {
+                    db.doc(`users/${u.uid}`).update({ active: false, updatedAt: FV.serverTimestamp() }).catch(err => alert("Update failed: " + errMsg(err)));
+                }
+            };
+
+            const reactivateUser = (u) => {
+                if(confirm(`Restore access for Employee: ${u.name}? (Their previous Access Key will work again.)`)) {
+                    db.doc(`users/${u.uid}`).update({ active: true, updatedAt: FV.serverTimestamp() }).catch(err => alert("Update failed: " + errMsg(err)));
+                }
+            };
+
+            const currentEntries = useMemo(() => entries.filter(e => e.date === selectedDate), [entries, selectedDate]);
+            
+            const handleAdd = (e) => {
+                e.preventDefault();
+                const rawVal = val.replace(/,/g, '');
+                const amt = parseInt(rawVal, 10);
+                if (!amt && amt !== 0) return;
+                if (!Number.isSafeInteger(amt)) { alert("Amount too large."); return; }
+                
+                const ref = db.collection('entries').doc();
+                writeOp(ref.set({
+                    id: ref.id,
+                    amount: amt,
+                    date: selectedDate,
+                    time: new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',hour12:true}),
+                    status: 'ok',
+                    createdBy: currentUser.name,
+                    createdByUid: currentUser.uid,
+                    ts: Date.now(),
+                    createdAt: FV.serverTimestamp(),
+                    expireAt: expireAtFor(selectedDate)
+                }));
+
+                setVal('');
+                inputRef.current?.focus();
+            };
+
+            const canModify = (x) => currentUser.role === 'admin' || (x.createdByUid && x.createdByUid === currentUser.uid);
+
+            const toggle = (x) => {
+                if (!canModify(x)) { alert("ACCESS DENIED"); return; }
+                writeOp(db.doc(`entries/${x.id}`).update({ status: x.status === 'ok' ? 'pending' : 'ok', updatedAt: FV.serverTimestamp() }));
+            };
+
+            const remove = (id) => {
+                if(confirm("Delete this entry?")) {
+                    writeOp(db.doc(`entries/${id}`).delete());
+                }
+            };
+
+            // Purge a whole date: needs the Admin Master Key (verified by Firebase on a side session)
+            const removeAllForDate = async () => {
+                if(currentEntries.length === 0) return;
+                
+                const pwd = prompt("SECURITY CLEARANCE REQUIRED: Enter Master Key:");
+                if (!pwd) return;
+
+                const sec = await getSecondary();
+                try { await sec.auth.signInWithEmailAndPassword(idToEmail(ADMIN_ID), pwd); }
+                catch(err) { alert(err && err.code === 'auth/too-many-requests' ? "Clearance Denied! Too many attempts, try later." : "Clearance Denied!"); return; }
+                try {
+                    if(confirm(`WARNING: This permanently purges all records for ${selectedDate}. Proceed?`)) {
+                        setSyncing(true);
+                        const snap = await sec.db.collection('entries').where('date', '==', selectedDate).get();
+                        await commitInChunks(snap.docs.map(d => b => b.delete(d.ref)), sec.db);
+                    }
+                } catch(err) { alert("Purge failed: " + errMsg(err)); }
+                setSyncing(false);
+                await sec.auth.signOut().catch(() => {});
+            };
+
+            const saveEdit = (e) => {
+                e.preventDefault();
+                const newAmt = parseInt(editModal.amount.toString().replace(/,/g, ''), 10);
+                if(!newAmt && newAmt !== 0) return;
+                if(!Number.isSafeInteger(newAmt)) { alert("Amount too large."); return; }
+                writeOp(db.doc(`entries/${editModal.id}`).update({ amount: newAmt, updatedAt: FV.serverTimestamp() }));
+                setEditModal({ open: false, id: null, amount: '' });
+            };
+
+            const stats = useMemo(() => {
+                const active = currentEntries.filter(x => x.status === 'ok');
+                const tot = active.reduce((a,b)=>a+(b.amount||0),0);
+                const com = Math.round(tot*0.009); 
+                const mid = Math.ceil(active.length/2);
+                return { tot, com, pay: tot-com, count: active.length, left: active.slice(0,mid), right: active.slice(mid), mid };
+            }, [currentEntries]);
+
+            const exportImg = async () => {
+                if(!currentEntries.length) return alert("No Data");
+                setLoading(true);
+                setTimeout(async()=>{
+                    const cvs = await html2canvas(document.getElementById('ghost'),{scale:2,width:500,windowWidth:500});
+                    cvs.toBlob(async(b)=>{
+                        const f = new File([b],`Payout-${selectedDate}.png`,{type:'image/png'});
+                        if(navigator.share) try{await navigator.share({files:[f]})}catch(e){}
+                        else { const a=document.createElement('a'); a.download=f.name; a.href=cvs.toDataURL(); a.click(); }
+                        setLoading(false);
+                    });
+                },300);
+            };
+
+            if(view === 'boot') {
+                return (
+                    <div className="h-full flex flex-col items-center justify-center bg-[#0a0f1c] p-6">
+                        <h1 className="text-3xl font-black text-white tracking-[0.2em] uppercase">ATLANTA</h1>
+                        <p className="text-[10px] text-slate-500 uppercase tracking-widest mt-4 animate-pulse">Connecting securely…</p>
+                    </div>
+                );
+            }
+
+            // ==========================================
+            // 🛡️ NEW CAMOUFLAGED CORPORATE LOGIN SCREEN
+            // ==========================================
+            if(view === 'setup') {
+                return (
+                    <div className="h-full flex flex-col items-center justify-center bg-[#0a0f1c] p-6 relative overflow-hidden">
+                        <div className="absolute top-0 left-0 w-full h-full overflow-hidden z-0 pointer-events-none">
+                            <div className="absolute w-[30rem] h-[30rem] bg-blue-600 rounded-full blur-[100px] opacity-10 -top-20 -left-20"></div>
+                            <div className="absolute w-[25rem] h-[25rem] bg-indigo-600 rounded-full blur-[100px] opacity-10 bottom-10 -right-10"></div>
+                        </div>
+                        <div className="bg-slate-900/60 backdrop-blur-xl border border-slate-700/50 p-8 rounded-3xl shadow-2xl w-full max-w-md z-10">
+                            <div className="text-center mb-10">
+                                <h1 className="text-3xl font-black text-white tracking-[0.2em] uppercase">ATLANTA</h1>
+                                <h2 className="text-xs font-bold text-blue-400 tracking-[0.4em] uppercase mt-1">Overseas</h2>
+                                <div className="w-12 h-1 bg-gradient-to-r from-blue-500 to-indigo-500 mx-auto mt-5 rounded-full"></div>
+                            </div>
+                            <div className="flex items-center justify-center gap-2 mb-6 text-slate-400">
+                                <Shield size={16} />
+                                <h3 className="text-sm font-semibold tracking-widest uppercase">Create Admin</h3>
+                            </div>
+                            <form id="setup-form" onSubmit={handleSetup} className="space-y-5">
+                                <div>
+                                    <label className="text-[10px] font-bold text-slate-500 ml-1 uppercase tracking-widest mb-1 block">Employee ID</label>
+                                    <input type="text" value="Admin" readOnly className="w-full bg-slate-950/50 border border-slate-700/50 rounded-xl px-4 py-3.5 font-bold text-slate-400 text-lg outline-none" />
+                                </div>
+                                <div>
+                                    <label className="text-[10px] font-bold text-slate-500 ml-1 uppercase tracking-widest mb-1 block">New Access Key</label>
+                                    <input type="password" value={setupPass} onChange={e=>setSetupPass(e.target.value)} placeholder="••••••••" className="w-full bg-slate-950/50 border border-slate-700/50 rounded-xl px-4 py-3.5 font-bold text-white text-lg outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all placeholder:text-slate-600" />
+                                </div>
+                                <div>
+                                    <label className="text-[10px] font-bold text-slate-500 ml-1 uppercase tracking-widest mb-1 block">Confirm Access Key</label>
+                                    <input type="password" value={setupPass2} onChange={e=>setSetupPass2(e.target.value)} placeholder="••••••••" className="w-full bg-slate-950/50 border border-slate-700/50 rounded-xl px-4 py-3.5 font-bold text-white text-lg outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all placeholder:text-slate-600" />
+                                </div>
+                                <button className="w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-bold py-4 rounded-xl shadow-lg active:scale-95 transition-all uppercase tracking-[0.15em] text-xs mt-4">
+                                    Create Admin
+                                </button>
+                            </form>
+                            <div className="mt-10 text-center space-y-1">
+                                <p className="text-[9px] text-slate-500 uppercase tracking-widest">One-time setup · Data syncs across all devices</p>
+                                <p className="text-[9px] text-slate-600 uppercase tracking-widest">Authorized Internal Use Only</p>
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+
+            if(view === 'login') {
+                return (
+                    <div className="h-full flex flex-col items-center justify-center bg-[#0a0f1c] p-6 relative overflow-hidden">
+                        {/* Abstract Corporate Background Elements */}
+                        <div className="absolute top-0 left-0 w-full h-full overflow-hidden z-0 pointer-events-none">
+                            <div className="absolute w-[30rem] h-[30rem] bg-blue-600 rounded-full blur-[100px] opacity-10 -top-20 -left-20"></div>
+                            <div className="absolute w-[25rem] h-[25rem] bg-indigo-600 rounded-full blur-[100px] opacity-10 bottom-10 -right-10"></div>
+                        </div>
+
+                        {/* Login Card */}
+                        <div className="bg-slate-900/60 backdrop-blur-xl border border-slate-700/50 p-8 rounded-3xl shadow-2xl w-full max-w-md z-10">
+                            
+                            <div className="text-center mb-10">
+                                <h1 className="text-3xl font-black text-white tracking-[0.2em] uppercase">ATLANTA</h1>
+                                <h2 className="text-xs font-bold text-blue-400 tracking-[0.4em] uppercase mt-1">Overseas</h2>
+                                <div className="w-12 h-1 bg-gradient-to-r from-blue-500 to-indigo-500 mx-auto mt-5 rounded-full"></div>
+                            </div>
+                            
+                            <div className="flex items-center justify-center gap-2 mb-6 text-slate-400">
+                                <Shield size={16} />
+                                <h3 className="text-sm font-semibold tracking-widest uppercase">Employee Portal</h3>
+                            </div>
+
+                            <form onSubmit={handleLogin} className="space-y-5">
+                                <div>
+                                    <label className="text-[10px] font-bold text-slate-500 ml-1 uppercase tracking-widest mb-1 block">Employee ID</label>
+                                    <input type="text" value={loginUser} onChange={e=>setLoginUser(e.target.value)} placeholder="Enter ID" autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="username" className="w-full bg-slate-950/50 border border-slate-700/50 rounded-xl px-4 py-3.5 font-bold text-white text-lg outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all placeholder:text-slate-600" />
+                                </div>
+                                <div>
+                                    <label className="text-[10px] font-bold text-slate-500 ml-1 uppercase tracking-widest mb-1 block">Access Key</label>
+                                    <input type={showPass ? "text" : "password"} value={loginPass} onChange={e=>setLoginPass(e.target.value)} placeholder="••••••••" autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="current-password" className="w-full bg-slate-950/50 border border-slate-700/50 rounded-xl px-4 py-3.5 font-bold text-white text-lg outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all placeholder:text-slate-600" />
+                                    <button type="button" onClick={()=>setShowPass(v=>!v)} className="mt-2 text-xs font-bold text-slate-400 hover:text-white">{showPass ? 'Hide Access Key' : 'Show Access Key'}</button>
+                                </div>
+                                <button className="w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-bold py-4 rounded-xl shadow-lg active:scale-95 transition-all uppercase tracking-[0.15em] text-xs mt-4">
+                                    Authorize
+                                </button>
+                            </form>
+
+                            <div className="mt-10 text-center space-y-1">
+                                <p className="text-[9px] text-slate-500 uppercase tracking-widest">© 2026 Atlanta Overseas</p>
+                                <p className="text-[9px] text-slate-600 uppercase tracking-widest">Authorized Internal Use Only</p>
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+            // ==========================================
+
+            if(view === 'admin') {
+                return (
+                    <div className="h-full bg-slate-800 text-white flex flex-col">
+                        <header className="p-4 border-b border-slate-700 flex justify-between items-center">
+                            <h1 className="font-bold text-xl flex items-center gap-2"><Settings className="text-indigo-400"/> IT Dashboard</h1>
+                            <div className="flex gap-4">
+                                <button onClick={()=>setView('ledger')} className="bg-indigo-600 px-3 py-1 rounded text-sm font-bold">App Access</button>
+                                <button onClick={()=>handleLogout()} className="text-slate-400 hover:text-white"><LogOut size={20}/></button>
+                            </div>
+                        </header>
+                        
+                        <main className="p-4 flex-1 overflow-y-auto max-w-md mx-auto w-full">
+                            <div className="bg-slate-700 p-4 rounded-xl mb-6 shadow-lg">
+                                <h2 className="text-sm font-bold text-indigo-300 mb-3 uppercase tracking-wider">Provision New Access</h2>
+                                <form onSubmit={handleCreateUser} className="flex flex-col gap-3">
+                                    <input type="text" value={newUser} onChange={e=>setNewUser(e.target.value)} placeholder="Employee ID" className="bg-slate-800 border border-slate-600 text-white p-3 rounded-lg outline-none" />
+                                    <input type="text" value={newPass} onChange={e=>setNewPass(e.target.value)} placeholder="Access Key" className="bg-slate-800 border border-slate-600 text-white p-3 rounded-lg outline-none" />
+                                    <button disabled={busy} className="bg-indigo-500 hover:bg-indigo-600 disabled:opacity-50 text-white font-bold py-3 rounded-lg">{busy ? 'Granting…' : 'Grant Access'}</button>
+                                </form>
+                            </div>
+
+                            <div className="bg-slate-700 p-4 rounded-xl mb-6 shadow-lg">
+                                <h2 className="text-sm font-bold text-indigo-300 mb-3 uppercase tracking-wider">Backup &amp; Restore</h2>
+                                <div className="flex gap-3">
+                                    <button type="button" onClick={handleBackup} className="flex-1 bg-indigo-500 hover:bg-indigo-600 text-white font-bold py-3 rounded-lg">Backup</button>
+                                    <button type="button" onClick={()=>restoreRef.current?.click()} className="flex-1 bg-slate-800 border border-slate-600 hover:bg-slate-900 text-white font-bold py-3 rounded-lg">Restore</button>
+                                    <input ref={restoreRef} id="restore-input" type="file" accept="application/json,.json" onChange={handleRestore} className="hidden" />
+                                </div>
+                                <p className="text-[10px] text-slate-400 mt-2">Download the directory + entries as JSON, or restore entries from a backup (applies to all devices).</p>
+                            </div>
+
+                            <h2 className="text-sm font-bold text-slate-400 mb-2 uppercase tracking-wider">Active Directory</h2>
+                            <div className="space-y-2">
+                                {users.map(u => (
+                                    <div key={u.uid} className={`bg-slate-700 p-3 rounded-lg flex justify-between items-center border border-slate-600 ${u.active?'':'opacity-50'}`}>
+                                        <div className="flex items-center gap-3">
+                                            <div className={`p-2 rounded-full ${u.role==='admin'?'bg-red-500/20 text-red-400':'bg-emerald-500/20 text-emerald-400'}`}><UserIcon size={18}/></div>
+                                            <div>
+                                                <div className="font-bold">{u.name} <span className="text-[10px] text-slate-400 uppercase">({u.active ? u.role : 'revoked'})</span></div>
+                                            </div>
+                                        </div>
+                                        {u.role !== 'admin' && (u.active ? (
+                                            <button onClick={()=>deleteUser(u)} className="p-2 text-slate-400 hover:text-red-400"><Trash size={18}/></button>
+                                        ) : (
+                                            <button onClick={()=>reactivateUser(u)} className="px-2 py-1 text-[10px] font-bold uppercase rounded bg-emerald-500/20 text-emerald-300">Restore Access</button>
+                                        ))}
+                                    </div>
+                                ))}
+                            </div>
+                        </main>
+                    </div>
+                );
+            }
+
+            return (
+                <>
+                    <header className="bg-white border-b p-3 sticky top-0 z-20">
+                        <div className="flex justify-between items-center mb-2">
+                            <div className="flex items-center gap-2 relative bg-indigo-50 p-2 rounded-lg text-indigo-600">
+                                <Calendar size={20} />
+                                <span className="text-sm font-bold">{new Date(selectedDate + 'T00:00:00').toLocaleDateString('en-IN',{day:'numeric',month:'short'})}</span>
+                                <input type="date" max={getToday()} value={selectedDate} onChange={e=>setSelectedDate(e.target.value)} className="absolute inset-0 opacity-0" />
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <div className="px-2 py-1 bg-slate-100 rounded text-xs font-bold text-slate-500 uppercase flex items-center gap-1">
+                                    <UserIcon size={12}/> {currentUser?.name}
+                                </div>
+                                {currentUser?.role === 'admin' && (
+                                    <button onClick={()=>setView('admin')} className="text-xs bg-purple-100 text-purple-700 px-2 py-1 rounded font-bold">Admin</button>
+                                )}
+                            </div>
+                            <div className="flex gap-2">
+                                {currentEntries.length > 0 && <button onClick={removeAllForDate} className="p-2 text-red-500 bg-red-50 rounded-md"><ClearAll size={18}/></button>}
+                                <button onClick={()=>fetchData()} className={`p-2 rounded-md bg-slate-100 ${syncing?'animate-spin text-indigo-600':'text-slate-500'}`}><Refresh size={18}/></button>
+                                <button onClick={exportImg} className="p-2 text-indigo-600 bg-indigo-50 rounded-md"><Share size={18}/></button>
+                                <button onClick={()=>handleLogout()} className="p-2 text-slate-400 bg-slate-100 rounded-md"><LogOut size={18}/></button>
+                            </div>
+                        </div>
+                        <div className="bg-slate-800 text-white p-3 rounded-xl shadow-lg flex justify-between items-center">
+                            <div><div className="text-xs text-slate-400 font-bold uppercase">Net Payout (0.9% Comm. Ded.)</div><div className="text-2xl font-black">₹ {formatCurrency(stats.pay).replace('₹ ','')}</div></div>
+                            <div className="text-right"><div className="text-xs text-slate-400">Total Entries</div><div className="font-bold text-lg">{stats.count}</div></div>
+                        </div>
+                    </header>
+
+                    <main className="flex-1 overflow-y-auto p-3 space-y-2 pb-24 bg-slate-50">
+                        {currentEntries.length===0 && <div className="text-center text-slate-300 py-10">No entries for this date</div>}
+                        {currentEntries.map(x => {
+                            const isMine = canModify(x);
+                            const isNegative = x.amount < 0;
+                            return (
+                                <div key={x.id} className={`bg-white p-3 rounded-xl flex items-center gap-3 shadow-sm border ${x.status!=='ok'?'opacity-50 grayscale':''}`}>
+                                    <button onClick={()=>toggle(x)}>{x.status==='ok'?<Check className="text-emerald-500" fill="#ecfdf5"/>:<Circle className="text-slate-300"/>}</button>
+                                    <div className="flex-1">
+                                        <div className={`font-bold text-lg ${isNegative ? 'text-red-600' : 'text-slate-800'}`}>{formatCurrency(x.amount)}</div>
+                                        <div className="flex items-center gap-2"><span className="text-xs text-slate-400">{x.time}</span>{x.createdBy && <span className="text-[10px] bg-slate-100 text-slate-500 px-1 rounded uppercase font-bold">{x.createdBy}</span>}</div>
+                                    </div>
+                                    {isMine ? (
+                                        <div className="flex gap-1">
+                                            <button onClick={()=>setEditModal({open:true,id:x.id,amount:x.amount})} className="p-2 text-slate-400 hover:text-indigo-600 bg-slate-50 rounded-lg"><Edit size={16}/></button>
+                                            <button onClick={()=>remove(x.id)} className="p-2 text-slate-400 hover:text-red-500 bg-slate-50 rounded-lg"><Trash size={16}/></button>
+                                        </div>
+                                    ) : <div className="p-2"><Lock size={14} className="text-slate-300"/></div>}
+                                </div>
+                            );
+                        })}
+                    </main>
+
+                    <footer className="bg-white border-t p-3 z-30 fixed bottom-0 left-0 right-0 max-w-xl mx-auto">
+                        <form onSubmit={handleAdd} className="flex gap-2 relative">
+                            <div className="relative flex-1">
+                                <span className="absolute left-4 top-3.5 text-slate-400 font-bold">₹</span>
+                                <input ref={inputRef} type="tel" inputmode="numeric" value={val} 
+                                    onChange={e=>{
+                                        let v = e.target.value.replace(/[^0-9-]/g,'');
+                                        if((v.match(/-/g)||[]).length > 1) return; 
+                                        if(v === '-') { setVal('-'); return; } 
+                                        setVal(v ? parseInt(v, 10).toLocaleString('en-IN') : '');
+                                    }} 
+                                    className="w-full bg-slate-100 rounded-xl pl-8 pr-4 py-3 font-bold text-lg outline-none" placeholder="Amount (+/-)" />
+                            </div>
+                            <button disabled={!val} className="bg-indigo-600 disabled:opacity-50 text-white w-14 rounded-xl flex items-center justify-center shadow-lg"><Arrow size={24}/></button>
+                        </form>
+                    </footer>
+
+                    {editModal.open && (
+                        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+                            <form onSubmit={saveEdit} className="bg-white w-full max-w-xs p-5 rounded-2xl shadow-2xl">
+                                <h3 className="text-lg font-bold mb-4">Edit Amount</h3>
+                                <input autoFocus type="tel" inputmode="numeric" value={editModal.amount} 
+                                    onChange={e => {
+                                        let v = e.target.value.replace(/[^0-9-]/g,'');
+                                        setEditModal({...editModal, amount: v});
+                                    }} 
+                                    className="w-full bg-slate-100 border-none rounded-xl px-4 py-3 font-bold text-xl mb-4 text-center" />
+                                <div className="flex gap-2">
+                                    <button type="button" onClick={()=>setEditModal({open:false,id:null,amount:''})} className="flex-1 py-3 font-bold text-slate-500 bg-slate-100 rounded-xl">Cancel</button>
+                                    <button type="submit" className="flex-1 py-3 font-bold text-white bg-indigo-600 rounded-xl">Save</button>
+                                </div>
+                            </form>
+                        </div>
+                    )}
+                    
+                    <div id="ghost" style={{position:'fixed',left:'-200vw',width:'500px',background:'#fff',padding:'30px',zIndex:-1}}>
+                        <div className="border-b-2 border-black pb-4 mb-4 flex justify-between items-end">
+                            <div><h1 className="text-2xl font-black uppercase">Payout Report</h1><p className="text-sm text-gray-500 font-bold">{selectedDate}</p></div>
+                            <div className="text-right"><div className="text-xs text-gray-400 uppercase font-bold">Net Payable</div><div className="text-3xl font-black text-indigo-600">{formatCurrency(stats.pay)}</div></div>
+                        </div>
+                        <div className="grid grid-cols-3 gap-4 mb-6 text-center bg-gray-100 p-3 rounded">
+                            <div><div className="text-[10px] uppercase font-bold text-gray-400">Total</div><div className="font-bold">{formatCurrency(stats.tot)}</div></div>
+                            <div><div className="text-[10px] uppercase font-bold text-red-400">Comm (0.9%)</div><div className="font-bold text-red-500">-{formatCurrency(stats.com)}</div></div>
+                            <div><div className="text-[10px] uppercase font-bold text-gray-400">Count</div><div className="font-bold">{stats.count}</div></div>
+                        </div>
+                        <div className="flex gap-8">
+                            <div className="flex-1"><table className="w-full text-xs text-left"><thead><tr className="border-b"><th className="pb-2 text-gray-400">#</th><th className="pb-2 text-gray-400">Amount</th></tr></thead><tbody>{stats.left.map((x,i)=><tr key={i}><td className="py-2 text-gray-400">{i+1}</td><td className={`py-2 font-bold ${x.amount < 0 ? 'text-red-500' : ''}`}>{formatCurrency(x.amount)}</td></tr>)}</tbody></table></div>
+                            <div className="flex-1"><table className="w-full text-xs text-left"><thead><tr className="border-b"><th className="pb-2 text-gray-400">#</th><th className="pb-2 text-gray-400">Amount</th></tr></thead><tbody>{stats.right.map((x,i)=><tr key={i}><td className="py-2 text-gray-400">{stats.mid+i+1}</td><td className={`py-2 font-bold ${x.amount < 0 ? 'text-red-500' : ''}`}>{formatCurrency(x.amount)}</td></tr>)}</tbody></table></div>
+                        </div>
+                    </div>
+                    {loading && <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 text-white font-bold">Generating Report...</div>}
+                </>
+            );
+        }
+        ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+</body>
+</html>
